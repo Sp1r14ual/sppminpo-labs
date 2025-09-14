@@ -1,10 +1,11 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.stats import norm
+from scipy.stats import skew, kurtosis, norm
 from scipy.optimize import brentq
 from mpmath import mp, quad
 
-mp.dps = 40  # точность для mpmath интеграции
+mp.dps = 40  # точность интегралов
+
 
 class HuberDistribution:
     def __init__(self, v: float):
@@ -12,126 +13,112 @@ class HuberDistribution:
             raise ValueError("v must be in (0,1)")
         self.v = float(v)
 
-    def _solve_k(self) -> float:
-        """Надёжное численное решение уравнения для k (на отрезке (0, 20])."""
+    def _solve_k(self):
         def eq(k):
             return 2.0 * norm.pdf(k) / k + 2.0 * (norm.cdf(k) - 1.0) - self.v / (1.0 - self.v)
-        # brentq требует, чтобы на концах был знакопеременный (ищем в фиксированном интервале)
-        a = 1e-8
-        b = 20.0
-        return float(brentq(eq, a, b))
+        return float(brentq(eq, 1e-8, 20.0))
 
-    def k(self) -> float:
-        return self._solve_k()
+    def k(self): return self._solve_k()
 
     def pdf(self, x: float) -> float:
-        """Плотность Хьюбера f(x, v)."""
         k = self.k()
         coeff = (1.0 - self.v) / np.sqrt(2.0 * np.pi)
         ax = abs(x)
         if ax <= k:
-            return coeff * np.exp(-0.5 * x * x)
+            return coeff * np.exp(-0.5 * x**2)
         else:
-            return coeff * np.exp(0.5 * k * k - k * ax)
+            return coeff * np.exp(0.5 * k**2 - k * ax)
 
-    def P(self) -> float:
-        """P = ∫_{-k}^{k} f(x) dx, вычисляется численно."""
+    def P(self):
         k = mp.mpf(self.k())
         v_mp = mp.mpf(self.v)
         coeff = (1 - v_mp) / mp.sqrt(2 * mp.pi)
-        def integrand(t):
-            return coeff * mp.e**(-0.5 * t**2)
-        I = quad(integrand, [-k, k])
-        return float(I)
+        return float(quad(lambda t: coeff * mp.e**(-0.5 * t**2), [-k, k]))
 
     def _moment(self, n: int) -> float:
-        """m_n = ∫ x^n f(x) dx, считаем через 2*∫_{0}^{∞} с разбиением на [0,k] и [k,∞)."""
         k = mp.mpf(self.k())
         v_mp = mp.mpf(self.v)
         coeff = (1 - v_mp) / mp.sqrt(2 * mp.pi)
 
-        def integrand_central(t):
-            return (t**n) * coeff * mp.e**(-0.5 * t**2)
-        def integrand_tail(t):
-            return (t**n) * coeff * mp.e**(0.5 * k**2 - k * t)
+        def central(t): return (t**n) * coeff * mp.e**(-0.5 * t**2)
+        def tail(t): return (t**n) * coeff * mp.e**(0.5 * k**2 - k*t)
 
-        I1 = quad(integrand_central, [mp.mpf('0.0'), k])
-        I2 = quad(integrand_tail, [k, mp.inf])
-        return float(2.0 * (I1 + I2))
+        I1 = quad(central, [0, k])
+        I2 = quad(tail, [k, mp.inf])
+        return float(2 * (I1 + I2))
 
-    def variance(self) -> float:
-        """В силу симметрии мат.ожидание = 0, дисперсия = второй момент."""
-        return self._moment(2)
-
-    def excess_kurtosis(self) -> float:
+    def variance(self): return self._moment(2)
+    def excess_kurtosis(self):
         m2 = self._moment(2)
         m4 = self._moment(4)
-        return m4 / (m2 * m2) - 3.0
+        return m4 / m2**2 - 3
 
     def sample(self, size=1, random_state=None):
-        """
-        Генерация выборки:
-         - r1~U(0,1). Если r1<=P -> берём нормальную X и проверяем |X|<=k
-         - иначе: r2~U(0,1), x2 = k - ln(r2)/k, знак по r1 vs (1+P)/2
-        Для нормалей используем Box-Muller (парно) для эффективности.
-        """
         rng = np.random.default_rng(random_state)
-        k = float(self.k())
-        P = float(self.P())
-        samples = []
-        normal_buffer = []
+        k, P = self.k(), self.P()
+        samples, normal_buffer = [], []
 
         def next_normal():
             if normal_buffer:
                 return normal_buffer.pop()
-            u1, u2 = rng.uniform(0.0, 1.0), rng.uniform(0.0, 1.0)
+            u1, u2 = rng.uniform(), rng.uniform()
             r = np.sqrt(-2.0 * np.log(u1))
-            z1 = r * np.cos(2.0 * np.pi * u2)
-            z2 = r * np.sin(2.0 * np.pi * u2)
+            z1, z2 = r*np.cos(2*np.pi*u2), r*np.sin(2*np.pi*u2)
             normal_buffer.append(z2)
             return z1
 
         for _ in range(size):
-            r1 = rng.uniform(0.0, 1.0)
-            if r1 <= P:
-                # центральная нормальная часть с отсечением
+            r1 = rng.uniform()
+            if r1 <= P:  # центр
                 while True:
                     x1 = next_normal()
                     if abs(x1) <= k:
                         samples.append(x1)
                         break
-            else:
-                r2 = rng.uniform(0.0, 1.0)
-                x2 = k - np.log(r2) / k
-                if r1 <= (1.0 + P) / 2.0:
-                    samples.append(x2)
-                else:
-                    samples.append(-x2)
+            else:  # хвост
+                r2 = rng.uniform()
+                x2 = k - np.log(r2)/k
+                samples.append(x2 if r1 <= (1+P)/2 else -x2)
+
         return np.array(samples)
+
+
+# --- Засорение распределения ---
+def contaminate_data(data, contamination_fraction=0.1, shift=5.0, scale=2.0, random_state=None):
+    rng = np.random.default_rng(random_state)
+    contaminated = data.copy()
+    n = len(data)
+    m = int(contamination_fraction * n)
+    idx = rng.choice(n, size=m, replace=False)
+    contaminated[idx] = shift + scale * rng.normal(size=m)
+    return contaminated
+
+
+# --- Выборочные характеристики ---
+def sample_statistics(data):
+    mean = np.mean(data)
+    var = np.var(data, ddof=1)
+    skewness = skew(data)
+    kurt = kurtosis(data)  # эксцесс
+    median = np.median(data)
+    trimmed_mean = np.mean(np.sort(data)[len(data)//10:-len(data)//10])  # 10% усечение
+    return dict(mean=mean, var=var, skewness=skewness, kurt=kurt,
+                median=median, trimmed_mean=trimmed_mean)
+
 
 # === Пример использования ===
 if __name__ == "__main__":
-    v = 0.01
-    huber = HuberDistribution(v=v)
-    print(f"v = {huber.v}")
-    print(f"k = {huber.k():.4f}")
-    print(f"σ² = {huber.variance():.4f}")
-    print(f"γ₂ = {huber.excess_kurtosis():.4f}")
-    print(f"P = {huber.P():.4f}")
+    huber = HuberDistribution(v=0.1)
+    pure = huber.sample(size=1000000, random_state=1)
+    contaminated = contaminate_data(pure, contamination_fraction=0.1, shift=5, scale=2)
 
-    data = huber.sample(size=100000, random_state=42)
-    
-    # строим гистограмму (нормированную)
-    plt.hist(data, bins=100, density=True, alpha=0.5, label="sample")
+    print("Выборочные характеристики (чистое):", sample_statistics(pure))
+    print("Выборочные характеристики (засорённое):", sample_statistics(contaminated))
 
-    # теоретическая плотность
-    xs = np.linspace(min(data), max(data), 500)
-    ys = [huber.pdf(x) for x in xs]
-    plt.plot(xs, ys, "r-", linewidth=2, label="pdf")
-
-    plt.title(f"Huber distribution (v={v})")
-    plt.xlabel("x")
-    plt.ylabel("density")
+    # Сравнение гистограмм
+    plt.hist(pure, bins=50, density=True, alpha=0.5, label="pure")
+    plt.hist(contaminated, bins=50, density=True, alpha=0.5, label="contaminated")
+    xs = np.linspace(min(contaminated), max(contaminated), 500)
+    plt.plot(xs, [huber.pdf(x) for x in xs], "r-", lw=2, label="теоретическая pdf")
     plt.legend()
-    plt.grid(alpha=0.3)
     plt.show()
